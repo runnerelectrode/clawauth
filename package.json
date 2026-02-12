@@ -1,0 +1,31 @@
+{
+  "name": "clawauth",
+  "version": "0.1.0",
+  "description": "Cryptographic identity for AI agents using OpenBotAuth. Ed25519 signing for agent-browser sessions with RFC 9421 HTTP Message Signatures.",
+  "type": "module",
+  "bin": {
+    "clawauth": "./bin/clawauth.mjs"
+  },
+  "scripts": {
+    "postinstall": "node ./lib/postinstall.mjs"
+  },
+  "keywords": [
+    "openbotauth",
+    "agent-browser",
+    "ed25519",
+    "rfc9421",
+    "http-signatures",
+    "ai-agent",
+    "bot-auth",
+    "openclaw"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/OpenBotAuth/clawauth"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {}
+}
