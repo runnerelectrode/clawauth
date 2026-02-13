@@ -7,42 +7,26 @@
  * Integrates Ed25519 signing with agent-browser sessions.
  *
  * Usage:
- *   clawauth init [agent-name]          Generate Ed25519 key pair
- *   clawauth sign <url>                 Sign a browser session and get headers
- *   clawauth session <url>              Create a signed agent-browser session
- *   clawauth derive <sub-agent-label>   Derive a sub-agent key
- *   clawauth sub-session <label> <url>  Create a signed sub-agent session
- *   clawauth register [agent-name]      Register key with OBA Registry
- *   clawauth register-sso               Register via enterprise SSO
- *   clawauth list                       List agents and keys
- *   clawauth sessions                   List active sessions
- *   clawauth whoami                     Show current agent identity
- *   clawauth export [agent-name]        Export public key / JWKS
- *   clawauth headers <url>              Output only the signed headers JSON
+ *   clawauth init                         Generate Ed25519 key pair
+ *   clawauth register [agent-name]        Register with OBA Registry
+ *   clawauth register-sso                 Register via enterprise SSO
+ *   clawauth sign <method> <url>          Sign a request and output headers
+ *   clawauth session <url>                Create a signed agent-browser session
+ *   clawauth whoami                       Show current agent identity
+ *   clawauth export                       Export public key as JWK
  */
 
-import { parseArgs } from "node:util";
 import { randomUUID } from "node:crypto";
 
 const args = process.argv.slice(2);
 const command = args[0];
 
+const OBA_API = "https://api.openbotauth.org";
+
 async function main() {
   switch (command) {
     case "init":
       await cmdInit();
-      break;
-    case "sign":
-      await cmdSign();
-      break;
-    case "session":
-      await cmdSession();
-      break;
-    case "derive":
-      await cmdDerive();
-      break;
-    case "sub-session":
-      await cmdSubSession();
       break;
     case "register":
       await cmdRegister();
@@ -50,23 +34,17 @@ async function main() {
     case "register-sso":
       await cmdRegisterSSO();
       break;
-    case "list":
-      await cmdList();
+    case "sign":
+      await cmdSign();
       break;
-    case "sessions":
-      await cmdSessions();
+    case "session":
+      await cmdSession();
       break;
     case "whoami":
       await cmdWhoami();
       break;
     case "export":
       await cmdExport();
-      break;
-    case "headers":
-      await cmdHeaders();
-      break;
-    case "ephemeral":
-      await cmdEphemeral();
       break;
     case "help":
     case "--help":
@@ -84,168 +62,163 @@ async function main() {
 // ── Commands ───────────────────────────────────────────────────────────────
 
 async function cmdInit() {
-  const agentName = args[1] || "default";
-  const { generateKeyPair } = await import("../lib/keygen.mjs");
+  const { keyExists, generateKeyPair } = await import("../lib/keygen.mjs");
 
-  console.log(`Generating Ed25519 key pair for agent "${agentName}"...`);
-  const result = generateKeyPair(agentName);
+  if (keyExists()) {
+    const { loadKey } = await import("../lib/keygen.mjs");
+    const key = loadKey();
+    console.log(`Key already exists.`);
+    console.log(`  kid: ${key.kid}`);
+    console.log(`  x:   ${key.x}`);
+    console.log(`\nTo register: clawauth register <agent-name>`);
+    return;
+  }
 
-  console.log(`\nKey pair generated successfully!`);
-  console.log(`  Key ID:       ${result.keyId}`);
-  console.log(`  Private key:  ${result.keyPath}`);
-  console.log(`  Public key:   ${result.pubKeyPath}`);
-  console.log(`  JWKS:         ${result.jwksPath}`);
-  console.log(`\nNext steps:`);
-  console.log(`  clawauth register ${agentName}   # Register with OBA Registry`);
-  console.log(`  clawauth session <url>           # Start a signed browser session`);
+  console.log("Generating Ed25519 key pair...");
+  const result = generateKeyPair();
+
+  console.log(`\nKey generated!`);
+  console.log(`  kid: ${result.kid}`);
+  console.log(`  x:   ${result.x}`);
+  console.log(`  Stored at: ${result.keyPath}`);
+  console.log(`\nNext: clawauth register <agent-name>`);
 }
 
 async function cmdSign() {
-  const url = args[1];
-  if (!url) {
-    console.error("Usage: clawauth sign <url> [--agent <name>]");
+  const method = args[1];
+  const url = args[2];
+  const jwksUrl = getFlag("--jwks") || getFlag("--signature-agent");
+
+  if (!method || !url) {
+    console.error("Usage: clawauth sign <METHOD> <URL> [--jwks <jwks-url>]");
     process.exit(1);
   }
 
-  const agentName = getFlag("--agent") || getFlag("-a");
-  const { createSignedSession } = await import("../lib/session.mjs");
+  const { loadKey, loadConfig } = await import("../lib/keygen.mjs");
+  const { signRequest } = await import("../lib/sign.mjs");
 
-  const session = createSignedSession({
-    targetUrl: url,
-    agentName: agentName || undefined,
+  const key = loadKey();
+  const config = loadConfig();
+  const resolvedJwksUrl = jwksUrl || config.jwksUrl || null;
+
+  const { headers } = signRequest({
+    method,
+    url,
+    privateKeyPem: key.privateKeyPem,
+    kid: key.kid,
+    jwksUrl: resolvedJwksUrl,
   });
 
-  console.log(JSON.stringify(session.headers, null, 2));
+  console.log(JSON.stringify(headers));
 }
 
 async function cmdSession() {
   const url = args[1];
   if (!url) {
-    console.error(
-      "Usage: clawauth session <url> [--agent <name>] [--session <name>] [--ephemeral] [--openclaw-session <id>]"
-    );
+    console.error("Usage: clawauth session <URL> [--method GET] [--session <name>] [--jwks <url>]");
     process.exit(1);
   }
 
-  const agentName = getFlag("--agent") || getFlag("-a");
+  const method = getFlag("--method") || "GET";
   const sessionName = getFlag("--session") || getFlag("-s");
-  const openClawSessionId = getFlag("--openclaw-session");
-  const ephemeral = args.includes("--ephemeral");
+  const jwksUrl = getFlag("--jwks") || getFlag("--signature-agent");
 
-  const { createSignedSession, generateStartupCommands } = await import(
-    "../lib/session.mjs"
-  );
+  const { loadKey, loadConfig } = await import("../lib/keygen.mjs");
+  const { signRequest } = await import("../lib/sign.mjs");
 
-  const session = createSignedSession({
-    targetUrl: url,
-    agentName: agentName || undefined,
-    sessionName: sessionName || undefined,
-    openClawSessionId: openClawSessionId || undefined,
-    ephemeral,
+  const key = loadKey();
+  const config = loadConfig();
+  const resolvedJwksUrl = jwksUrl || config.jwksUrl || null;
+
+  const { headers } = signRequest({
+    method,
+    url,
+    privateKeyPem: key.privateKeyPem,
+    kid: key.kid,
+    jwksUrl: resolvedJwksUrl,
   });
 
-  console.log(`Signed session created!`);
-  console.log(`  Session ID: ${session.sessionId}`);
-  console.log(`  Agent:      ${session.agentName}`);
-  console.log(`  Key ID:     ${session.keyId}`);
-  console.log(`\nRun these commands:\n`);
+  const headersJson = JSON.stringify(headers);
+  const sessionFlag = sessionName ? `--session ${sessionName} ` : "";
 
-  const commands = generateStartupCommands({
-    targetUrl: url,
-    agentName: agentName || undefined,
-    sessionName: sessionName || undefined,
-    openClawSessionId: openClawSessionId || undefined,
-    ephemeral,
-  });
-
-  for (const cmd of commands) {
-    console.log(`  ${cmd}`);
-  }
-}
-
-async function cmdDerive() {
-  const subLabel = args[1];
-  if (!subLabel) {
-    console.error(
-      "Usage: clawauth derive <sub-agent-label> [--agent <parent>]"
-    );
-    process.exit(1);
-  }
-
-  const parentAgent = getFlag("--agent") || getFlag("-a") || "default";
-  const { deriveSubAgentKey } = await import("../lib/derive.mjs");
-
-  console.log(
-    `Deriving sub-agent key "${subLabel}" from parent "${parentAgent}"...`
-  );
-  const result = deriveSubAgentKey(parentAgent, subLabel);
-
-  console.log(`\nSub-agent key derived!`);
-  console.log(`  Key ID:       ${result.keyId}`);
-  console.log(`  Parent:       ${result.parentAgent}`);
-  console.log(`  Sub-agent:    ${result.subAgentLabel}`);
-  console.log(`  Key file:     ${result.keyPath}`);
-}
-
-async function cmdSubSession() {
-  const subLabel = args[1];
-  const url = args[2];
-  if (!subLabel || !url) {
-    console.error(
-      "Usage: clawauth sub-session <sub-agent-label> <url> [--agent <parent>] [--session <name>]"
-    );
-    process.exit(1);
-  }
-
-  const parentAgent = getFlag("--agent") || getFlag("-a") || "default";
-  const sessionName = getFlag("--session") || getFlag("-s");
-  const openClawSessionId = getFlag("--openclaw-session");
-
-  const { createSubAgentSession } = await import("../lib/session.mjs");
-
-  const session = createSubAgentSession({
-    parentAgent,
-    subAgentLabel: subLabel,
-    targetUrl: url,
-    sessionName: sessionName || undefined,
-    openClawSessionId: openClawSessionId || undefined,
-  });
-
-  console.log(`Sub-agent session created!`);
-  console.log(`  Session ID:       ${session.sessionId}`);
-  console.log(`  Parent Agent:     ${session.parentAgent}`);
-  console.log(`  Sub-agent:        ${session.subAgentLabel}`);
-  console.log(`  Sub-agent Key ID: ${session.subAgentKeyId}`);
-  console.log(`\nRun this command:\n`);
-  console.log(`  ${session.command}`);
+  console.log(`Signed session for ${url}`);
+  console.log(`  kid: ${key.kid}`);
+  if (resolvedJwksUrl) console.log(`  Signature-Agent: ${resolvedJwksUrl}`);
+  console.log(`\nRun:\n`);
+  console.log(`  agent-browser ${sessionFlag}set headers '${headersJson}'`);
+  console.log(`  agent-browser ${sessionFlag}open ${url}`);
+  console.log(`\nNote: re-sign before navigating to a different URL.`);
 }
 
 async function cmdRegister() {
-  const agentName = args[1] || "default";
+  const agentName = args[1] || "my-agent";
   const token = getFlag("--token") || process.env.OBA_TOKEN;
-  const registryUrl = getFlag("--registry") || process.env.OBA_REGISTRY_URL;
 
   if (!token) {
-    console.error(
-      "Auth token required. Use --token <token> or set OBA_TOKEN env var."
-    );
-    console.error(
-      "Get a token at: https://registry.openbotauth.org/auth/github"
-    );
+    console.log("To register, you need an OBA token.");
+    console.log("");
+    console.log("1. Go to https://openbotauth.org/token");
+    console.log('2. Click "Login with GitHub"');
+    console.log("3. Copy the token and run:");
+    console.log(`   clawauth register ${agentName} --token <your-oba-token>`);
+    console.log("");
+    console.log("Or set OBA_TOKEN environment variable.");
     process.exit(1);
   }
 
-  const { registerKey } = await import("../lib/registry.mjs");
+  const { loadKey, saveToken, loadConfig, saveConfig } = await import(
+    "../lib/keygen.mjs"
+  );
+  const key = loadKey();
 
-  console.log(`Registering agent "${agentName}" with OBA Registry...`);
+  // Save token for future use
+  saveToken(token);
+
+  console.log(`Registering agent "${agentName}" with OBA...`);
+
   try {
-    const result = await registerKey(agentName, {
-      token,
-      registryUrl: registryUrl || undefined,
+    const response = await fetch(`${OBA_API}/agents`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        name: agentName,
+        agent_type: "agent",
+        public_key: {
+          kty: "OKP",
+          crv: "Ed25519",
+          kid: key.kid,
+          x: key.x,
+          use: "sig",
+          alg: "EdDSA",
+        },
+      }),
     });
-    console.log(`\nRegistered successfully!`);
-    console.log(`  Agent ID:  ${result.agentId}`);
-    console.log(`  JWKS URL:  ${result.jwksUrl}`);
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error(`Registration failed (${response.status}):`, JSON.stringify(data));
+      process.exit(1);
+    }
+
+    const jwksUrl = `${OBA_API}/agent-jwks/${data.id}`;
+
+    // Save to config
+    const config = loadConfig();
+    config.agentId = data.id;
+    config.agentName = agentName;
+    config.jwksUrl = jwksUrl;
+    config.registeredAt = new Date().toISOString();
+    saveConfig(config);
+
+    console.log(`\nRegistered!`);
+    console.log(`  Agent ID: ${data.id}`);
+    console.log(`  JWKS URL: ${jwksUrl}`);
+    console.log(`\nVerify: curl ${jwksUrl}`);
+    console.log(`\nNow run: clawauth session <url>`);
   } catch (err) {
     console.error(`Registration failed: ${err.message}`);
     process.exit(1);
@@ -256,190 +229,92 @@ async function cmdRegisterSSO() {
   const provider = getFlag("--provider");
   const orgId = getFlag("--org");
   const token = getFlag("--token") || process.env.OBA_SSO_TOKEN;
-  const agentName = getFlag("--agent") || "default";
-  const registryUrl = getFlag("--registry") || process.env.OBA_REGISTRY_URL;
 
   if (!provider || !orgId || !token) {
     console.error(
-      "Usage: clawauth register-sso --provider <okta|workos|descope> --org <org-id> --token <sso-token> [--agent <name>]"
+      "Usage: clawauth register-sso --provider <okta|workos|descope> --org <org-id> --token <sso-token>"
     );
     process.exit(1);
   }
 
-  const { registerWithSSO } = await import("../lib/registry.mjs");
+  const { loadKey } = await import("../lib/keygen.mjs");
+  const key = loadKey();
 
   console.log(`Registering via ${provider} SSO for org "${orgId}"...`);
   try {
-    const result = await registerWithSSO(agentName, {
-      provider,
-      orgId,
-      token,
-      registryUrl: registryUrl || undefined,
+    const response = await fetch(`${OBA_API}/enterprise/keys`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        "X-SSO-Provider": provider,
+        "X-Org-ID": orgId,
+      },
+      body: JSON.stringify({
+        key: {
+          kty: "OKP",
+          crv: "Ed25519",
+          kid: key.kid,
+          x: key.x,
+          use: "sig",
+          alg: "EdDSA",
+        },
+        sso: { provider, orgId },
+        metadata: { tool: "clawauth", platform: "openclaw" },
+      }),
     });
-    console.log(`\nSSO registration successful!`);
-    console.log(`  Agent ID:  ${result.agentId}`);
-    console.log(`  JWKS URL:  ${result.jwksUrl}`);
-    console.log(`  Provider:  ${provider}`);
-    console.log(`  Org:       ${orgId}`);
+
+    const data = await response.json();
+    console.log(JSON.stringify(data, null, 2));
   } catch (err) {
     console.error(`SSO registration failed: ${err.message}`);
     process.exit(1);
   }
 }
 
-async function cmdList() {
-  const { listAgents, loadConfig } = await import("../lib/keygen.mjs");
+async function cmdWhoami() {
+  const { keyExists, loadKey, loadConfig } = await import("../lib/keygen.mjs");
 
-  const agents = listAgents();
-  const config = loadConfig();
-
-  console.log("Agents:");
-  for (const [name, info] of Object.entries(agents)) {
-    const isDefault = config.defaultAgent === name ? " (default)" : "";
-    const registered = info.registry ? " [registered]" : "";
-    const sso = info.registry?.sso
-      ? ` [${info.registry.sso.provider}]`
-      : "";
-    console.log(`  ${name}${isDefault}${registered}${sso}`);
-    console.log(`    Key ID: ${info.keyId}`);
-    if (info.registry?.jwksUrl) {
-      console.log(`    JWKS:   ${info.registry.jwksUrl}`);
-    }
-  }
-
-  if (config.subAgents && Object.keys(config.subAgents).length > 0) {
-    console.log("\nSub-agents:");
-    for (const [id, sub] of Object.entries(config.subAgents)) {
-      const ephemeral = sub.ephemeral ? " [ephemeral]" : "";
-      console.log(`  ${sub.subAgentLabel}${ephemeral} (parent: ${sub.parentAgent})`);
-      console.log(`    Key ID: ${sub.keyId}`);
-    }
-  }
-}
-
-async function cmdSessions() {
-  const { listSessions } = await import("../lib/session.mjs");
-
-  const sessions = listSessions();
-  if (Object.keys(sessions).length === 0) {
-    console.log("No active sessions.");
+  if (!keyExists()) {
+    console.log("No identity found. Run: clawauth init");
     return;
   }
 
-  console.log("Active sessions:");
-  for (const [id, session] of Object.entries(sessions)) {
-    const ephemeral = session.ephemeral ? " [ephemeral]" : "";
-    console.log(`  ${id}${ephemeral}`);
-    console.log(`    Agent:   ${session.agentName}`);
-    console.log(`    URL:     ${session.targetUrl}`);
-    console.log(`    Created: ${session.createdAt}`);
-  }
-}
-
-async function cmdWhoami() {
-  const { loadConfig, loadPublicKey } = await import("../lib/keygen.mjs");
+  const key = loadKey();
   const config = loadConfig();
-  const agentName = args[1] || config.defaultAgent || "default";
 
-  try {
-    const pubKey = loadPublicKey(agentName);
-    console.log(`Agent: ${agentName}`);
-    console.log(`Key ID: ${pubKey.kid}`);
-    console.log(`Algorithm: ${pubKey.alg}`);
-    console.log(`Public Key (x): ${pubKey.x}`);
-    if (config.agents?.[agentName]?.registry) {
-      const reg = config.agents[agentName].registry;
-      console.log(`Registry: ${reg.url}`);
-      console.log(`Agent ID: ${reg.agentId}`);
-      console.log(`JWKS URL: ${reg.jwksUrl}`);
-      if (reg.sso) {
-        console.log(`SSO: ${reg.sso.provider} (org: ${reg.sso.orgId})`);
-      }
-    } else {
-      console.log(`Registry: not registered`);
-    }
-  } catch (err) {
-    console.error(err.message);
-    process.exit(1);
+  console.log(`kid:        ${key.kid}`);
+  console.log(`Public (x): ${key.x}`);
+  console.log(`Created:    ${key.createdAt}`);
+
+  if (config.agentId) {
+    console.log(`Agent ID:   ${config.agentId}`);
+    console.log(`Agent Name: ${config.agentName}`);
+    console.log(`JWKS URL:   ${config.jwksUrl}`);
+  } else {
+    console.log(`Registry:   not registered`);
   }
 }
 
 async function cmdExport() {
-  const agentName = args[1] || "default";
+  const { loadKey } = await import("../lib/keygen.mjs");
+  const key = loadKey();
+
+  const jwk = {
+    kty: "OKP",
+    crv: "Ed25519",
+    kid: key.kid,
+    x: key.x,
+    use: "sig",
+    alg: "EdDSA",
+  };
+
   const format = getFlag("--format") || "jwks";
-  const { loadPublicKey } = await import("../lib/keygen.mjs");
-
-  try {
-    const pubKey = loadPublicKey(agentName);
-    if (format === "jwk") {
-      console.log(JSON.stringify(pubKey, null, 2));
-    } else {
-      console.log(JSON.stringify({ keys: [pubKey] }, null, 2));
-    }
-  } catch (err) {
-    console.error(err.message);
-    process.exit(1);
+  if (format === "jwk") {
+    console.log(JSON.stringify(jwk, null, 2));
+  } else {
+    console.log(JSON.stringify({ keys: [jwk] }, null, 2));
   }
-}
-
-async function cmdHeaders() {
-  const url = args[1];
-  if (!url) {
-    console.error("Usage: clawauth headers <url> [--agent <name>] [--session-id <id>]");
-    process.exit(1);
-  }
-
-  const agentName = getFlag("--agent") || getFlag("-a");
-  const sessionId = getFlag("--session-id") || `oba-session-${randomUUID()}`;
-
-  const { loadPrivateKey, loadConfig } = await import("../lib/keygen.mjs");
-  const { generateBrowserHeaders } = await import("../lib/sign.mjs");
-  const { getJwksUrl } = await import("../lib/registry.mjs");
-
-  const config = loadConfig();
-  const agent = agentName || config.defaultAgent || "default";
-  const privateKeyJwk = loadPrivateKey(agent);
-  const jwksUrl = getJwksUrl(agent);
-
-  const headersJson = generateBrowserHeaders({
-    privateKeyJwk,
-    keyId: privateKeyJwk.kid,
-    targetUrl: url,
-    sessionId,
-    agentName: agent,
-    jwksUrl,
-  });
-
-  // Output raw JSON for piping into agent-browser
-  console.log(headersJson);
-}
-
-async function cmdEphemeral() {
-  const url = args[1];
-  if (!url) {
-    console.error(
-      "Usage: clawauth ephemeral <url> [--agent <name>] [--openclaw-session <id>]"
-    );
-    process.exit(1);
-  }
-
-  const agentName = getFlag("--agent") || getFlag("-a");
-  const openClawSessionId = getFlag("--openclaw-session") || `eph-${randomUUID()}`;
-
-  const { createSignedSession } = await import("../lib/session.mjs");
-
-  const session = createSignedSession({
-    targetUrl: url,
-    agentName: agentName || undefined,
-    openClawSessionId,
-    ephemeral: true,
-  });
-
-  console.log(`Ephemeral session created!`);
-  console.log(`  Session ID: ${session.sessionId}`);
-  console.log(`  Key ID:     ${session.keyId}`);
-  console.log(`\nRun:\n`);
-  console.log(`  ${session.command}`);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -452,49 +327,40 @@ function getFlag(flag) {
 
 function printHelp() {
   console.log(`
-clawauth - Cryptographic identity for AI agents (OpenBotAuth + Agent Browser)
+clawauth - Cryptographic identity for AI agents (OpenBotAuth)
 
 SETUP:
-  clawauth init [agent-name]              Generate Ed25519 key pair
-  clawauth register [agent-name]          Register key with OBA Registry
-  clawauth register-sso                   Register via enterprise SSO (Okta/WorkOS/Descope)
+  clawauth init                             Generate Ed25519 key pair
+  clawauth register [agent-name]            Register with OBA Registry
+  clawauth register-sso                     Register via enterprise SSO
 
-BROWSE WITH IDENTITY:
-  clawauth session <url>                  Create a signed agent-browser session
-  clawauth headers <url>                  Output signed headers JSON (for piping)
-  clawauth ephemeral <url>                Create an ephemeral session-bound key
-
-SUB-AGENTS:
-  clawauth derive <sub-agent-label>       Derive a sub-agent key from parent
-  clawauth sub-session <label> <url>      Create a signed sub-agent session
+SIGN & BROWSE:
+  clawauth sign <METHOD> <URL>              Output signed headers JSON
+  clawauth session <URL>                    Signed agent-browser session
 
 INFO:
-  clawauth whoami [agent-name]            Show current agent identity
-  clawauth list                           List all agents and sub-agents
-  clawauth sessions                       List active sessions
-  clawauth export [agent-name]            Export public key as JWKS
+  clawauth whoami                           Show current identity
+  clawauth export                           Export public key as JWKS
 
 FLAGS:
-  --agent, -a <name>                      Specify agent name
-  --session, -s <name>                    Agent-browser session name
-  --openclaw-session <id>                 Bind to OpenClaw session ID
-  --ephemeral                             Use ephemeral session key
-  --token <token>                         OBA Registry auth token
-  --provider <okta|workos|descope>        SSO provider for enterprise
-  --org <org-id>                          Organization ID for SSO
-  --registry <url>                        Custom registry URL
+  --token <token>                           OBA Registry auth token
+  --jwks <url>                              JWKS URL for Signature-Agent
+  --session, -s <name>                      agent-browser session name
+  --method <METHOD>                         HTTP method (default: GET)
+  --provider <okta|workos|descope>          SSO provider
+  --org <org-id>                            Organization ID for SSO
+  --format <jwk|jwks>                       Export format (default: jwks)
 
 ENVIRONMENT:
-  OBA_TOKEN                               Registry auth token
-  OBA_SSO_TOKEN                           SSO auth token
-  OBA_REGISTRY_URL                        Custom registry URL
+  OBA_TOKEN                                 Registry auth token
+  OBA_SSO_TOKEN                             SSO auth token
 
 EXAMPLES:
-  clawauth init my-agent
-  clawauth session https://example.com --agent my-agent
-  clawauth derive scraper --agent my-agent
-  clawauth sub-session scraper https://example.com --session scraper1
-  agent-browser set headers "$(clawauth headers https://example.com)"
+  clawauth init
+  clawauth register my-agent --token oba_abc123...
+  clawauth session https://example.com
+  clawauth sign GET https://example.com --jwks https://api.openbotauth.org/agent-jwks/xyz
+  agent-browser set headers "$(clawauth sign GET https://example.com)"
 `);
 }
 
