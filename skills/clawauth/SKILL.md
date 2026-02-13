@@ -366,18 +366,152 @@ A proper delegation/attestation protocol is being designed.
 
 RFC 9421 signatures are **per-request** — they are bound to the specific method, authority, and path. Setting headers once (Steps 4-5) only works for the initial page load. Sub-resources, XHRs, and redirects will carry stale signatures and get blocked.
 
-**Solution: Use the clawauth signing proxy.** It intercepts every HTTP/HTTPS request and adds a fresh signature automatically.
+**Solution: Start a local signing proxy.** It intercepts every HTTP/HTTPS request and adds a fresh signature automatically. No external packages needed — uses only Node.js built-ins and openssl.
+
+#### Step A: Write the proxy to a temp file
 
 ```bash
-# Install clawauth if not already installed
-npm install -g clawauth
+cat > /tmp/clawauth-proxy.mjs << 'PROXY_EOF'
+import { createServer as createHttpServer, request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { createServer as createTlsServer } from "node:tls";
+import { connect } from "node:net";
+import { createPrivateKey, sign as cryptoSign, randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { execSync } from "node:child_process";
 
-# Ensure you have a key (Step 2) and are registered (Step 3)
+const OBA_DIR = join(homedir(), ".config", "openbotauth");
+const KEY_FILE = join(OBA_DIR, "key.json");
+const CONFIG_FILE = join(OBA_DIR, "config.json");
+const CA_DIR = join(OBA_DIR, "ca");
+const CA_KEY = join(CA_DIR, "ca.key");
+const CA_CRT = join(CA_DIR, "ca.crt");
 
-# Start the signing proxy
-clawauth proxy --verbose
+// Load credentials
+if (!existsSync(KEY_FILE)) { console.error("No key found. Run keygen first."); process.exit(1); }
+const obaKey = JSON.parse(readFileSync(KEY_FILE, "utf-8"));
+let jwksUrl = null;
+if (existsSync(CONFIG_FILE)) { const c = JSON.parse(readFileSync(CONFIG_FILE, "utf-8")); jwksUrl = c.jwksUrl || null; }
 
-# In another terminal, browse through the proxy
+// Ensure CA exists
+mkdirSync(CA_DIR, { recursive: true, mode: 0o700 });
+if (!existsSync(CA_KEY) || !existsSync(CA_CRT)) {
+  console.log("Generating proxy CA certificate (one-time)...");
+  execSync(`openssl req -x509 -new -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -keyout "${CA_KEY}" -out "${CA_CRT}" -days 3650 -subj "/CN=clawauth Proxy CA/O=OpenBotAuth"`, { stdio: "pipe" });
+  execSync(`chmod 600 "${CA_KEY}"`);
+}
+
+// Per-domain cert cache
+const certCache = new Map();
+function getDomainCert(hostname) {
+  if (certCache.has(hostname)) return certCache.get(hostname);
+  const tk = join(CA_DIR, `_t_${hostname}.key`), tc = join(CA_DIR, `_t_${hostname}.csr`);
+  const to = join(CA_DIR, `_t_${hostname}.crt`), te = join(CA_DIR, `_t_${hostname}.ext`);
+  try {
+    execSync(`openssl ecparam -genkey -name prime256v1 -noout -out "${tk}"`, { stdio: "pipe" });
+    execSync(`openssl req -new -key "${tk}" -out "${tc}" -subj "/CN=${hostname}"`, { stdio: "pipe" });
+    writeFileSync(te, `subjectAltName=DNS:${hostname}\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth`);
+    execSync(`openssl x509 -req -sha256 -in "${tc}" -CA "${CA_CRT}" -CAkey "${CA_KEY}" -CAcreateserial -out "${to}" -days 365 -extfile "${te}"`, { stdio: "pipe" });
+    const r = { key: readFileSync(tk, "utf-8"), cert: readFileSync(to, "utf-8") };
+    certCache.set(hostname, r);
+    return r;
+  } finally { for (const f of [tk, tc, to, te]) try { execSync(`rm -f "${f}"`, { stdio: "pipe" }); } catch {} }
+}
+
+// RFC 9421 signing
+function signReq(method, authority, path) {
+  const created = Math.floor(Date.now() / 1000), expires = created + 300, nonce = randomUUID();
+  const lines = [`"@method": ${method.toUpperCase()}`, `"@authority": ${authority}`, `"@path": ${path}`];
+  const sigInput = `("@method" "@authority" "@path");created=${created};expires=${expires};nonce="${nonce}";keyid="${obaKey.kid}";alg="ed25519"`;
+  lines.push(`"@signature-params": ${sigInput}`);
+  const sig = cryptoSign(null, Buffer.from(lines.join("\n")), createPrivateKey(obaKey.privateKeyPem)).toString("base64");
+  const h = { signature: `sig1=:${sig}:`, "signature-input": `sig1=${sigInput}` };
+  if (jwksUrl) h["signature-agent"] = jwksUrl;
+  return h;
+}
+
+const verbose = process.argv.includes("--verbose") || process.argv.includes("-v");
+const port = parseInt(process.argv.find((a,i) => process.argv[i-1] === "--port")) || 8421;
+let rc = 0;
+function log(id, msg) { if (verbose) console.log(`[${id}] ${msg}`); }
+
+const server = createHttpServer((cReq, cRes) => {
+  const id = ++rc, url = new URL(cReq.url), auth = url.host, p = url.pathname + url.search;
+  const sig = signReq(cReq.method, auth, p);
+  log(id, `HTTP ${cReq.method} ${auth}${p} → signed`);
+  const h = { ...cReq.headers }; delete h["proxy-connection"]; delete h["proxy-authorization"];
+  Object.assign(h, sig); h.host = auth;
+  const fn = url.protocol === "https:" ? httpsRequest : httpRequest;
+  const pr = fn({ hostname: url.hostname, port: url.port || (url.protocol === "https:" ? 443 : 80), path: p, method: cReq.method, headers: h }, (r) => { cRes.writeHead(r.statusCode, r.headers); r.pipe(cRes); });
+  pr.on("error", (e) => { log(id, `Error: ${e.message}`); cRes.writeHead(502); cRes.end("Proxy error"); });
+  cReq.pipe(pr);
+});
+
+server.on("connect", (req, cSock, head) => {
+  const id = ++rc, [host, ps] = req.url.split(":"), tp = parseInt(ps) || 443;
+  log(id, `CONNECT ${host}:${tp} → MITM`);
+  cSock.write("HTTP/1.1 200 Connection Established\r\nProxy-Agent: clawauth-proxy\r\n\r\n");
+  const dc = getDomainCert(host);
+  const tls = createTlsServer({ key: dc.key, cert: dc.cert }, (ts) => {
+    let data = Buffer.alloc(0);
+    ts.on("data", (chunk) => {
+      data = Buffer.concat([data, chunk]);
+      const he = data.indexOf("\r\n\r\n");
+      if (he === -1) return;
+      const hs = data.subarray(0, he).toString(), body = data.subarray(he + 4);
+      const ls = hs.split("\r\n"), [method, path] = ls[0].split(" ");
+      const rh = {};
+      for (let i = 1; i < ls.length; i++) { const c = ls[i].indexOf(":"); if (c > 0) rh[ls[i].substring(0, c).trim().toLowerCase()] = ls[i].substring(c + 1).trim(); }
+      const cl = parseInt(rh["content-length"]) || 0, fp = path || "/";
+      const sig = signReq(method, host + (tp !== 443 ? `:${tp}` : ""), fp);
+      log(id, `HTTPS ${method} ${host}${fp} → signed`);
+      Object.assign(rh, sig);
+      const pr = httpsRequest({ hostname: host, port: tp, path: fp, method, headers: rh, rejectUnauthorized: true }, (r) => {
+        let resp = `HTTP/1.1 ${r.statusCode} ${r.statusMessage}\r\n`;
+        const rw = r.rawHeaders; for (let i = 0; i < rw.length; i += 2) resp += `${rw[i]}: ${rw[i+1]}\r\n`;
+        resp += "\r\n"; ts.write(resp); r.pipe(ts);
+      });
+      pr.on("error", (e) => { log(id, `Error: ${e.message}`); ts.end("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"); });
+      if (body.length > 0) pr.write(body);
+      if (cl <= body.length) { pr.end(); } else {
+        let recv = body.length;
+        const bh = (d) => { recv += d.length; pr.write(d); if (recv >= cl) { pr.end(); ts.removeListener("data", bh); } };
+        ts.on("data", bh);
+      }
+    });
+  });
+  tls.listen(0, "127.0.0.1", () => {
+    const lc = connect(tls.address().port, "127.0.0.1", () => { lc.write(head); lc.pipe(cSock); cSock.pipe(lc); });
+    lc.on("error", () => cSock.end()); cSock.on("error", () => lc.end());
+    cSock.on("close", () => { tls.close(); lc.end(); });
+  });
+});
+
+server.listen(port, "127.0.0.1", () => {
+  console.log(`clawauth signing proxy on http://127.0.0.1:${port}`);
+  console.log(`  kid: ${obaKey.kid}`);
+  if (jwksUrl) console.log(`  Signature-Agent: ${jwksUrl}`);
+  console.log("Every request gets a fresh RFC 9421 signature.");
+});
+PROXY_EOF
+echo "Proxy written to /tmp/clawauth-proxy.mjs"
+```
+
+#### Step B: Start the proxy
+
+```bash
+node /tmp/clawauth-proxy.mjs --verbose
+```
+
+This starts the signing proxy on `127.0.0.1:8421`. Every HTTP and HTTPS request flowing through it gets a fresh RFC 9421 Ed25519 signature.
+
+#### Step C: Browse through the proxy
+
+In another terminal (or from agent-browser):
+
+```bash
 agent-browser --proxy http://127.0.0.1:8421 open https://example.com
 ```
 
@@ -386,13 +520,7 @@ The proxy:
 - Handles both HTTP and HTTPS (generates a local CA for HTTPS MITM)
 - Includes the `Signature-Agent` header (JWKS URL) on every request
 - Runs on `127.0.0.1:8421` by default (configurable with `--port`)
-
-**OpenClaw usage:**
-```
-# If clawauth CLI is available in the environment:
-# 1. Start proxy in background
-# 2. Use agent-browser with --proxy flag
-```
+- Requires openssl (pre-installed on macOS/Linux) for HTTPS certificate generation
 
 **When to use Steps 4-5 instead:** Simple single-page-load scenarios where you control every navigation and can re-sign before each one.
 
