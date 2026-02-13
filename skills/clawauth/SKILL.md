@@ -362,19 +362,39 @@ A proper delegation/attestation protocol is being designed.
 
 ---
 
-### Per-Request Signing Limitations
+### Per-Request Signing via Proxy (Recommended for Real Browsing)
 
-RFC 9421 signatures are **per-request** — they are bound to the specific method, authority, and path of each request. This means:
+RFC 9421 signatures are **per-request** — they are bound to the specific method, authority, and path. Setting headers once (Steps 4-5) only works for the initial page load. Sub-resources, XHRs, and redirects will carry stale signatures and get blocked.
 
-- **Signatures expire** — the `expires` field enforces a 5-minute validity window
-- **Nonces are single-use** — replay protection means each signature is unique
-- **Path changes invalidate the signature** — navigating to a different page requires re-signing
+**Solution: Use the clawauth signing proxy.** It intercepts every HTTP/HTTPS request and adds a fresh signature automatically.
 
-**Current behavior:** Setting signed headers works for the initial page load. Subsequent navigations, XHRs, and redirects within the browser session will carry stale signatures.
+```bash
+# Install clawauth if not already installed
+npm install -g clawauth
 
-**Workaround:** Re-run Step 4 → Step 5 before each navigation you control from the agent.
+# Ensure you have a key (Step 2) and are registered (Step 3)
 
-**Future:** A per-request signing hook in agent-browser (`setRequestSigner`) is proposed to compute fresh signatures for every outgoing request automatically. See `docs/PROPOSAL-request-signer.md`.
+# Start the signing proxy
+clawauth proxy --verbose
+
+# In another terminal, browse through the proxy
+agent-browser --proxy http://127.0.0.1:8421 open https://example.com
+```
+
+The proxy:
+- Signs **every** outgoing request with a fresh RFC 9421 signature
+- Handles both HTTP and HTTPS (generates a local CA for HTTPS MITM)
+- Includes the `Signature-Agent` header (JWKS URL) on every request
+- Runs on `127.0.0.1:8421` by default (configurable with `--port`)
+
+**OpenClaw usage:**
+```
+# If clawauth CLI is available in the environment:
+# 1. Start proxy in background
+# 2. Use agent-browser with --proxy flag
+```
+
+**When to use Steps 4-5 instead:** Simple single-page-load scenarios where you control every navigation and can re-sign before each one.
 
 ---
 
@@ -393,7 +413,12 @@ RFC 9421 signatures are **per-request** — they are bound to the specific metho
 ```
 ~/.config/openbotauth/
 ├── key.json       # kid, x, publicKeyPem, privateKeyPem (chmod 600)
-└── token          # oba_xxx bearer token (chmod 600)
+├── key.pub.json   # Public JWK for sharing (chmod 644)
+├── config.json    # Agent ID, JWKS URL, registration info
+├── token          # oba_xxx bearer token (chmod 600)
+└── ca/            # Proxy CA certificate (auto-generated)
+    ├── ca.key     # CA private key
+    └── ca.crt     # CA certificate
 ```
 
 ### Links

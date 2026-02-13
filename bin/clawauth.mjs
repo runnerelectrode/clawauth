@@ -40,6 +40,9 @@ async function main() {
     case "session":
       await cmdSession();
       break;
+    case "proxy":
+      await cmdProxy();
+      break;
     case "whoami":
       await cmdWhoami();
       break;
@@ -272,6 +275,19 @@ async function cmdRegisterSSO() {
   }
 }
 
+async function cmdProxy() {
+  const proxyPort = getFlag("--port") || "8421";
+  const jwksUrl = getFlag("--jwks") || getFlag("--signature-agent");
+  const verbose = args.includes("--verbose") || args.includes("-v");
+
+  const { startProxy } = await import("../lib/proxy.mjs");
+  startProxy({
+    port: parseInt(proxyPort),
+    jwksUrl: jwksUrl || null,
+    verbose,
+  });
+}
+
 async function cmdWhoami() {
   const { keyExists, loadKey, loadConfig } = await import("../lib/keygen.mjs");
 
@@ -335,8 +351,9 @@ SETUP:
   clawauth register-sso                     Register via enterprise SSO
 
 SIGN & BROWSE:
+  clawauth proxy                            Start signing proxy (signs every request)
   clawauth sign <METHOD> <URL>              Output signed headers JSON
-  clawauth session <URL>                    Signed agent-browser session
+  clawauth session <URL>                    Signed agent-browser session (single URL)
 
 INFO:
   clawauth whoami                           Show current identity
@@ -358,9 +375,9 @@ ENVIRONMENT:
 EXAMPLES:
   clawauth init
   clawauth register my-agent --token oba_abc123...
-  clawauth session https://example.com
+  clawauth proxy --verbose
+  agent-browser --proxy http://127.0.0.1:8421 open https://example.com
   clawauth sign GET https://example.com --jwks https://api.openbotauth.org/agent-jwks/xyz
-  agent-browser set headers "$(clawauth sign GET https://example.com)"
 `);
 }
 

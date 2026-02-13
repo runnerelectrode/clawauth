@@ -22,7 +22,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/OpenBotAuth/clawauth"
+    "url": "https://github.com/runnerelectrode/clawauth"
   },
   "engines": {
     "node": ">=18.0.0"
