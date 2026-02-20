@@ -1,0 +1,11 @@
+{
+  "id": "clawauth",
+  "name": "clawauth",
+  "version": "0.1.0",
+  "description": "WBA identity signing for agent HTTP requests (RFC 9421 / Ed25519)",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
