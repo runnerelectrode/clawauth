@@ -42,7 +42,7 @@ agent-browser --proxy http://127.0.0.1:8421 open https://example.com
 
 ## How It Works
 
-### Signing Proxy (Recommended)
+### Signing Proxy
 
 The signing proxy sits between agent-browser and the target website, intercepting every HTTP/HTTPS request and adding fresh RFC 9421 signatures:
 
@@ -60,14 +60,44 @@ The signing proxy sits between agent-browser and the target website, interceptin
 This solves the per-request signing problem — RFC 9421 signatures are bound to `@method`, `@authority`, and `@path`, so setting headers once doesn't work for sub-resources, XHRs, and redirects.
 
 ```bash
-# Start proxy
+# Single-agent (default key from ~/.config/openbotauth/)
 clawauth proxy [--port 8421] [--verbose]
+
+# Multi-agent
+clawauth proxy --keys-dir ./keys --default-agent tars --verbose
 
 # Use with agent-browser
 agent-browser --proxy http://127.0.0.1:8421 open https://example.com
 ```
 
 For HTTPS, the proxy generates a self-signed CA on first run at `~/.config/openbotauth/ca/`. Chromium-based browsers via agent-browser handle this automatically.
+
+### Multi-Agent Proxy
+
+Run one proxy for multiple agents. Each agent gets its own key directory:
+
+```
+keys/
+  tars/key.json + config.json
+  case/key.json + config.json
+  kipp/key.json + config.json
+```
+
+Select which agent signs each request via the proxy URL username:
+
+```bash
+# Start multi-agent proxy
+clawauth proxy --keys-dir ./keys --default-agent tars
+
+# Default agent (tars)
+HTTP_PROXY=http://127.0.0.1:8421 curl https://example.com
+
+# Specific agent
+HTTP_PROXY=http://case@127.0.0.1:8421 curl https://example.com
+HTTP_PROXY=http://kipp@127.0.0.1:8421 curl https://example.com
+```
+
+Agent selection uses standard proxy authentication — the username from `http://username@host:port` maps to a key directory.
 
 ### Single-URL Signing
 
@@ -81,6 +111,33 @@ clawauth sign GET https://example.com
 clawauth session https://example.com
 ```
 
+## OpenClaw Plugin
+
+clawauth includes an OpenClaw gateway plugin that gives agents a `signed_fetch` tool for making signed HTTP requests.
+
+### Installation
+
+1. Place or symlink the clawauth directory in `~/.openclaw/extensions/clawauth/`
+2. Enable in `openclaw.json`:
+   ```json
+   { "plugins": { "entries": { "clawauth": { "enabled": true } } } }
+   ```
+3. Add `signed_fetch` to your allowed tools list if using a sandbox
+4. Restart the gateway
+
+### Agent Setup
+
+Each agent's workspace needs a `clawauth/` directory with its keys:
+
+```
+workspace/
+  clawauth/
+    key.json      # Ed25519 keypair (from clawauth init)
+    config.json   # agent_id, jwksUrl (from clawauth register)
+```
+
+The plugin auto-loads keys per agent and provides a `signed_fetch` tool that signs every outbound request with RFC 9421 signatures. It also logs when agents use unsigned `web_fetch` while a signing key is available.
+
 ## HTTP Headers
 
 Every signed request includes:
@@ -91,39 +148,19 @@ Every signed request includes:
 | `Signature-Input` | Covered components `(@method @authority @path)`, `created`, `expires`, `nonce`, `keyid`, `alg` |
 | `Signature-Agent` | JWKS URL for public key resolution (from OBA Registry) |
 
-Example:
-```
-Signature: sig1=:MEUCIQDx...=:
-Signature-Input: sig1=("@method" "@authority" "@path");created=1234567890;expires=1234568190;nonce="uuid";keyid="abc123";alg="ed25519"
-Signature-Agent: https://api.openbotauth.org/agent-jwks/your-agent-id
-```
-
 Signatures expire after 5 minutes and include a UUID nonce for replay protection.
 
-## OBA Registration
+## Security
 
-Register your public key for remote verification:
-
-```bash
-# 1. Get a token at https://openbotauth.org/token (GitHub OAuth)
-# 2. Register
-clawauth register my-agent --token <your-oba-token>
-
-# 3. Verify your JWKS endpoint
-curl https://api.openbotauth.org/agent-jwks/<your-agent-id>
-```
-
-The JWKS URL is automatically included as the `Signature-Agent` header in all signed requests.
-
-## Enterprise SSO
-
-Register agent identities with your organization's SSO:
-
-```bash
-clawauth register-sso --provider okta --org org_123 --token $OBA_SSO_TOKEN
-clawauth register-sso --provider workos --org org_456 --token $WORKOS_TOKEN
-clawauth register-sso --provider descope --org proj_789 --token $DESCOPE_TOKEN
-```
+- **No shell injection** — All subprocess calls use `execFileSync` (no shell interpolation)
+- **SSRF protection** — DNS resolve-first with private/reserved IP blocking (127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x, ::1, fc00::, fe80::, link-local, multicast)
+- **Hostname validation** — Regex + `isIP` check, rejects non-FQDN targets
+- **Path traversal prevention** — Agent names validated against `/^[a-zA-Z0-9._-]+$/`, cert filenames use SHA-256 hashes
+- **Buffer caps** — 64KB max header size to prevent memory exhaustion
+- **Connection timeouts** — 2-minute timeout on HTTPS tunnels
+- **Private keys** stored with `0600` permissions (owner-only read/write)
+- HTTPS MITM proxy uses per-domain certificates signed by a local CA
+- Never sends private keys or OBA tokens to any domain other than `api.openbotauth.org`
 
 ## CLI Reference
 
@@ -142,13 +179,18 @@ INFO:
   clawauth whoami                           Show current identity
   clawauth export                           Export public key as JWKS
 
-FLAGS:
+PROXY FLAGS:
+  --port <port>                             Proxy port (default: 8421)
+  --bind <address>                          Bind address (default: 127.0.0.1)
+  --keys-dir <path>                         Multi-agent keys directory
+  --default-agent <name>                    Default agent when no proxy auth
+  --verbose, -v                             Verbose logging
+
+OTHER FLAGS:
   --token <token>                           OBA Registry auth token
   --jwks <url>                              JWKS URL for Signature-Agent
   --session, -s <name>                      agent-browser session name
   --method <METHOD>                         HTTP method (default: GET)
-  --port <port>                             Proxy port (default: 8421)
-  --verbose, -v                             Verbose logging
   --format <jwk|jwks>                       Export format (default: jwks)
 
 ENVIRONMENT:
@@ -168,14 +210,6 @@ ENVIRONMENT:
     ├── ca.key       # CA private key
     └── ca.crt       # CA certificate
 ```
-
-## Security
-
-- Private keys stored with `0600` permissions (owner-only read/write)
-- Signatures include nonce (UUID) for replay protection
-- 5-minute expiration window on all signatures
-- HTTPS MITM proxy uses per-domain certificates signed by a local CA
-- Never send private keys or OBA tokens to any domain other than `api.openbotauth.org`
 
 ## License
 
